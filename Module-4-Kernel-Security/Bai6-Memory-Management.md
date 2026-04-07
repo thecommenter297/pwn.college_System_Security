@@ -192,3 +192,77 @@ Một Page Table Entry (PTE) 64-bit có cấu trúc như sau:
     *   `1`: **Không được phép thực thi**. CPU sẽ từ chối chạy mã lệnh từ trang này.
     *   `0`: Được phép thực thi.
     > 🔥 **Ứng dụng (Nền tảng của W^X):** Đây là mitigation chống lại các cuộc tấn công phun shellcode kinh điển. Các vùng nhớ dữ liệu như Stack và Heap sẽ luôn được đánh dấu là NX=1. Điều này buộc hacker phải sử dụng các kỹ thuật tấn công phức tạp hơn như **Return-Oriented Programming (ROP)**.
+
+## 9. Các nhân vật chính trong vở kịch "Dịch địa chỉ"
+
+### A. Thanh ghi CR3 (Page-Table Base Register)
+
+Đây là "chìa khóa" của sự cô lập giữa các process.
+*   **Chức năng:** Thanh ghi `CR3` chứa **địa chỉ vật lý** của bảng cấp cao nhất (PML4).
+*   **Cơ chế hoạt động:** Mỗi khi Kernel thực hiện một **Context Switch** (chuyển CPU từ việc chạy process A sang chạy process B), một trong những hành động đầu tiên và quan trọng nhất của nó là:
+    ```assembly
+    mov cr3, address_of_process_B_pml4
+    ```
+    Hành động này ngay lập tức thay đổi toàn bộ "thế giới quan" của CPU. Nó vứt bỏ tấm bản đồ bộ nhớ của process A và thay bằng tấm bản đồ của process B. Đây chính là cách các không gian địa chỉ ảo được giữ tách biệt hoàn toàn với nhau.
+*   **Bảo mật:** Lệnh `mov cr3, ...` là một lệnh đặc quyền, **chỉ có thể thực thi ở Ring 0**. Nếu một chương trình ở Ring 3 cố tình chạy lệnh này, nó sẽ bị tiêu diệt ngay lập tức.
+
+### B. MMU (Memory Management Unit)
+
+Đây là một bộ phận **phần cứng** tích hợp bên trong CPU. Nó là "người công nhân" chăm chỉ thực hiện quá trình "Page Walk" (đi bộ qua 4 cấp bảng) mà chúng ta đã mô tả ở phần 2.
+
+Việc dịch địa chỉ bằng phần cứng giúp tốc độ truy cập bộ nhớ nhanh hơn hàng triệu lần so với việc thực hiện bằng phần mềm. Mỗi khi bạn thực thi một lệnh như `mov rax, [rbx]`, MMU sẽ tự động thực hiện toàn bộ quá trình dịch địa chỉ từ `rbx` một cách vô hình.
+
+### C. TLB (Translation Lookaside Buffer)
+
+Quá trình Page Walk, dù được thực hiện bằng phần cứng, vẫn đòi hỏi 4 lần đọc bộ nhớ (từ RAM) để đến được dữ liệu cuối cùng. Điều này vẫn còn chậm.
+
+Để tăng tốc, CPU tích hợp một bộ nhớ đệm (cache) siêu nhanh gọi là **TLB**.
+*   **Chức năng:** TLB lưu lại các kết quả dịch địa chỉ gần đây. Nó giống như một cuốn sổ tay ghi nhớ: "VPN `0x123` đã được dịch ra PFN `0xABC`".
+*   **Cơ chế hoạt động:**
+    1.  Khi MMU cần dịch một địa chỉ ảo, nó sẽ **tìm trong TLB trước tiên**.
+    2.  Nếu tìm thấy (TLB Hit), nó sẽ lấy ngay kết quả PFN mà không cần thực hiện Page Walk. Quá trình này cực nhanh.
+    3.  Nếu không tìm thấy (TLB Miss), MMU mới thực hiện Page Walk đầy đủ, sau đó lưu kết quả vào TLB để lần sau dùng lại.
+
+> **Tác động đến Hacker:** Khi bạn thay đổi Page Table (ví dụ, trong một exploit để map một trang nhớ mới), bạn cần phải làm vô hiệu hóa (invalidate) các entry cũ trong TLB. Nếu không, CPU có thể vẫn sử dụng kết quả dịch địa chỉ đã cache, dẫn đến exploit thất bại. Kernel cung cấp các hàm như `flush_tlb()` cho mục đích này.
+
+## 10. Kernel nhìn thấy tất cả (The Kernel Sees All)
+
+Một câu hỏi quan trọng: Nếu mỗi process có một `CR3` riêng, làm thế nào Kernel có thể truy cập vào bộ nhớ của tất cả các process?
+
+Câu trả lời là: **Kernel là một phần của mọi tấm bản đồ.**
+*   Khi Kernel tạo Page Table cho một process, nó sẽ chia không gian địa chỉ ảo 48-bit thành hai nửa:
+    *   **Nửa dưới (Canonical lower-half):** Từ `0x0000000000000000` đến `0x00007FFFFFFFFFFF`. Đây là vùng của **Userspace**.
+    *   **Nửa trên (Canonical upper-half):** Từ `0xFFFF800000000000` đến `0xFFFFFFFFFFFFFFFF`. Đây là vùng của **Kernelspace**.
+*   Phần mapping cho nửa trên (Kernelspace) là **giống hệt nhau** trên Page Table của tất cả các process.
+*   Khi một syscall xảy ra, CPU chuyển sang Ring 0. `CR3` không thay đổi, nhưng vì giờ đây CPU có đặc quyền cao hơn, nó có thể truy cập vào nửa trên của không gian địa chỉ ảo.
+
+**Cách Kernel truy cập bộ nhớ vật lý:**
+Để tiện cho việc quản lý, Kernel không truy cập trực tiếp vào RAM vật lý. Thay vào đó, nó ánh xạ (map) toàn bộ bộ nhớ vật lý vào một vùng liên tục trong không gian địa chỉ ảo của chính nó.
+
+Linux cung cấp hai macro (thực chất là phép cộng/trừ đơn giản) để chuyển đổi:
+*   `phys_to_virt(physical_address)`: Chuyển địa chỉ vật lý sang địa chỉ ảo trong không gian kernel.
+*   `virt_to_phys(kernel_virtual_address)`: Chuyển ngược lại.
+
+> 🔥 **Góc nhìn Hacker:** Nếu bạn tìm ra được giá trị offset giữa hai không gian địa chỉ này (bằng cách reverse-engineer Kernel), bạn có thể tự do chuyển đổi giữa các địa chỉ và đọc/ghi toàn bộ RAM vật lý một khi đã có được một primitive ghi đè trong Kernel.
+
+## 11. Cách ly Máy ảo (Virtual Machine Isolation)
+
+Bây giờ hãy nâng độ phức tạp lên một tầm cao mới: Làm thế nào để cô lập các máy ảo (VM) với nhau? Kernel của mỗi máy ảo (Guest Kernel) cũng nghĩ rằng nó đang toàn quyền kiểm soát bộ nhớ vật lý.
+
+CPU hiện đại giải quyết vấn đề này bằng **Extended Page Tables (EPT)**, được quản lý bởi Hypervisor (Ring -1).
+
+Quá trình dịch địa chỉ trong một môi trường ảo hóa diễn ra theo **hai chiều (two-dimensional)**:
+1.  **Guest Virtual Address (GVA) -> Guest Physical Address (GPA):**
+    *   Guest OS (máy ảo) sử dụng Page Table của chính nó (do `Guest CR3` trỏ tới) để dịch địa chỉ ảo của một process ra địa chỉ vật lý... **mà nó nghĩ là thật**. Địa chỉ này được gọi là Guest Physical Address.
+2.  **Guest Physical Address (GPA) -> Host Physical Address (HPA):**
+    *   Sau đó, phần cứng sẽ thực hiện một **lần dịch địa chỉ thứ hai**. Nó sử dụng một bộ Page Table khác, gọi là **EPT** (do Hypervisor kiểm soát), để dịch địa chỉ GPA ra địa chỉ vật lý thực sự trên thanh RAM của máy chủ (Host Physical Address).
+
+Quá trình này hoàn toàn trong suốt đối với Guest OS. Nó tạo ra một lớp cách ly phần cứng cực kỳ mạnh mẽ, ngăn một máy ảo này truy cập vào bộ nhớ của một máy ảo khác.
+
+---
+**Tóm tắt cho GitHub:**
+Quản lý bộ nhớ là sự phối hợp nhịp nhàng giữa Kernel và phần cứng.
+*   **`CR3`** là chìa khóa để cách ly bộ nhớ giữa các process.
+*   **MMU** là phần cứng thực hiện việc dịch địa chỉ, và **TLB** là bộ đệm để tăng tốc quá trình này.
+*   Kernel là một phần của mọi không gian địa chỉ ảo, cho phép nó giám sát và quản lý tất cả các process. Nó sử dụng các macro như **`phys_to_virt`** để truy cập thuận tiện vào toàn bộ RAM.
+*   Trong môi trường ảo hóa, một lớp dịch địa chỉ thứ hai gọi là **Extended Page Tables (EPT)** được thêm vào để cách ly hoàn toàn các máy ảo với nhau ở cấp độ phần cứng.
